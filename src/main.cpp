@@ -21,6 +21,7 @@
 #include <ctime>
 #include <filesystem>
 #include <fcntl.h>
+#include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <locale>
@@ -33,12 +34,14 @@
 #include <string>
 #include <string_view>
 #include <sys/wait.h>
+#include <sys/stat.h>
+#include <termios.h>
 #include <unistd.h>
 #include <utility>
 #include <vector>
 
 #ifndef TPLINK_IPC_VERSION
-#define TPLINK_IPC_VERSION "0.1.0"
+#define TPLINK_IPC_VERSION "0.2.0"
 #endif
 
 using Json = nlohmann::json;
@@ -49,6 +52,99 @@ std::string env(const char* name) {
   const char* value = std::getenv(name);
   if (!value || !*value) throw std::runtime_error(std::string("missing environment variable: ") + name);
   return value;
+}
+
+struct CameraSettings {
+  std::string host, user, password;
+};
+
+std::filesystem::path config_path() {
+  std::filesystem::path base;
+  if (const char* xdg = std::getenv("XDG_CONFIG_HOME"); xdg && *xdg) base = xdg;
+  else base = std::filesystem::path(env("HOME")) / ".config";
+  if (!base.is_absolute()) throw std::runtime_error("XDG_CONFIG_HOME must be an absolute path");
+  return base / "tplink-ipc-mcp" / "config.json";
+}
+
+CameraSettings load_settings() {
+  CameraSettings settings;
+  const char* xdg = std::getenv("XDG_CONFIG_HOME");
+  if ((xdg && *xdg) || std::getenv("HOME")) {
+    const auto path = config_path();
+    if (std::filesystem::exists(path)) {
+      struct stat info{};
+      if (lstat(path.c_str(), &info) != 0 || !S_ISREG(info.st_mode) || info.st_uid != getuid() ||
+          (info.st_mode & 077) != 0 || info.st_size < 0 || info.st_size > 4096)
+        throw std::runtime_error("camera config must be a private regular file owned by this user");
+      std::ifstream in(path);
+      if (!in) throw std::runtime_error("cannot read camera config");
+      try {
+        const Json saved = Json::parse(in);
+        settings.host = saved.at("host").get<std::string>();
+        settings.user = saved.at("user").get<std::string>();
+        settings.password = saved.at("password").get<std::string>();
+      } catch (...) { throw std::runtime_error("camera config is invalid"); }
+    }
+  }
+  if (const char* value = std::getenv("IPC_HOST")) settings.host = value;
+  if (const char* value = std::getenv("IPC_USER")) settings.user = value;
+  if (const char* value = std::getenv("IPC_PASSWORD")) settings.password = value;
+  return settings;
+}
+
+void save_settings(const CameraSettings& settings) {
+  const auto path = config_path();
+  std::filesystem::create_directories(path.parent_path());
+  if (chmod(path.parent_path().c_str(), 0700) != 0) throw std::runtime_error("cannot protect camera config directory");
+  std::string name = (path.parent_path() / ".config-XXXXXX").string();
+  std::vector<char> temporary(name.begin(), name.end());
+  temporary.push_back('\0');
+  int fd = mkstemp(temporary.data());
+  if (fd < 0) throw std::runtime_error("cannot create camera config");
+  const std::string content = Json({{"host", settings.host}, {"user", settings.user}, {"password", settings.password}}).dump(2) + "\n";
+  try {
+    size_t offset = 0;
+    while (offset < content.size()) {
+      const ssize_t count = write(fd, content.data() + offset, content.size() - offset);
+      if (count <= 0) throw std::runtime_error("cannot write camera config");
+      offset += static_cast<size_t>(count);
+    }
+    const int sync_result = fsync(fd);
+    const int close_result = close(fd);
+    fd = -1;
+    if (sync_result != 0 || close_result != 0) throw std::runtime_error("cannot save camera config");
+    std::filesystem::rename(temporary.data(), path);
+  } catch (...) {
+    if (fd >= 0) close(fd);
+    unlink(temporary.data());
+    throw;
+  }
+}
+
+std::string prompt(const std::string& label) {
+  std::cerr << label << std::flush;
+  std::string value;
+  if (!std::getline(std::cin, value)) throw std::runtime_error("input cancelled");
+  return value;
+}
+
+std::string prompt_password() {
+  if (!isatty(STDIN_FILENO)) throw std::runtime_error("password entry requires an interactive terminal");
+  termios original{};
+  if (tcgetattr(STDIN_FILENO, &original) != 0) throw std::runtime_error("cannot read terminal settings");
+  termios hidden = original;
+  hidden.c_lflag &= ~ECHO;
+  if (tcsetattr(STDIN_FILENO, TCSANOW, &hidden) != 0) throw std::runtime_error("cannot hide password input");
+  try {
+    const std::string password = prompt("Camera password: ");
+    tcsetattr(STDIN_FILENO, TCSANOW, &original);
+    std::cerr << '\n';
+    return password;
+  } catch (...) {
+    tcsetattr(STDIN_FILENO, TCSANOW, &original);
+    std::cerr << '\n';
+    throw;
+  }
 }
 
 std::string base64(const unsigned char* data, size_t size) {
@@ -230,9 +326,12 @@ std::string md5hex(const std::string& input) {
 
 class Camera {
  public:
-  Camera() : host_(env("IPC_HOST")), user_(env("IPC_USER")), password_(env("IPC_PASSWORD")) {
-    if (host_.find('/') != std::string::npos || host_.find(':') != std::string::npos || host_.find('@') != std::string::npos)
-      throw std::runtime_error("IPC_HOST must be a hostname or IPv4 address without a port");
+  Camera() : Camera(load_settings()) {}
+  explicit Camera(CameraSettings settings) : host_(std::move(settings.host)), user_(std::move(settings.user)), password_(std::move(settings.password)) {
+    if (host_.empty()) throw std::runtime_error("camera not configured; run tplink-ipc-mcp configure");
+    if (!std::all_of(host_.begin(), host_.end(), [](unsigned char c) {
+          return std::isalnum(c) || c == '.' || c == '-' || c == '_';
+        })) throw std::runtime_error("camera address must be a hostname or IPv4 address without a port");
     base_ = "http://" + host_;
   }
 
@@ -247,6 +346,18 @@ class Camera {
 
   Json action(std::string module, std::string name, Json value) {
     return request({{"method", "do"}, {module, {{name, value}}}});
+  }
+
+  Json activation_status() {
+    const auto [status, body] = http(base_ + "/pc/Content.htm", nullptr);
+    if (status != 401) throw std::runtime_error("camera activation status unavailable");
+    const Json response = Json::parse(body);
+    const int code = response.at("data").at("code").get<int>();
+    if (code == -40414) return {{"state", "needs_activation"}, {"username", "admin"}};
+    if (code == -40405) return {{"state", "needs_password_change"}, {"username", "admin"}};
+    if (code == -40407) return {{"state", "activated"}, {"username", "admin"},
+      {"credentials_configured", !user_.empty() && !password_.empty()}};
+    throw std::runtime_error("unknown camera activation status " + std::to_string(code));
   }
 
   Json manual_alarm(int seconds) {
@@ -673,6 +784,7 @@ class Camera {
   }
 
   void login() {
+    if (user_.empty() || password_.empty()) throw std::runtime_error("camera credentials missing; run tplink-ipc-mcp configure");
     const auto [challenge_code, challenge_body] = http(base_ + "/pc/Content.htm", nullptr);
     if (challenge_code != 401) throw std::runtime_error("camera auth challenge unavailable");
     const Json challenge = Json::parse(challenge_body).at("data");
@@ -725,6 +837,7 @@ Json tool(std::string name, std::string description, Json properties = Json::obj
 Json tools() {
   const Json boolean = {{"type", "boolean"}};
   return Json::array({
+    tool("camera_activation_status", "Read whether the camera needs first-time activation. Requires only a camera address and does not change the device."),
     tool("camera_info", "Read camera model, firmware and supported local features."),
     tool("camera_status", "Read current human/motion/tamper detection, tracking, privacy, night vision, alarm, and SD card status."),
     tool("camera_events", "Wait briefly for ONVIF motion or tamper events. This firmware does not expose person classification through ONVIF.",
@@ -767,6 +880,7 @@ Json tools() {
 Json text_result(const Json& value) { return {{"content", Json::array({{{"type", "text"}, {"text", value.dump()}}})}}; }
 
 Json call(Camera& camera, const std::string& name, const Json& args) {
+  if (name == "camera_activation_status") return text_result(camera.activation_status());
   if (name == "camera_info") {
     const Json basic = camera.get("device_info", {"basic_info"}).at("basic_info");
     const Json modules = camera.get("function", {"module_spec"}).at("module_spec");
@@ -853,10 +967,59 @@ Json call(Camera& camera, const std::string& name, const Json& args) {
   throw std::runtime_error("unknown tool");
 }
 
+int command_line(int argc, char** argv) {
+  if (argc != 2) throw std::runtime_error("usage: tplink-ipc-mcp [configure|check]");
+  const std::string command = argv[1];
+  if (command == "--help" || command == "help") {
+    std::cout << "Usage: tplink-ipc-mcp [configure|check]\n"
+                 "  configure  Save camera address and credentials after verifying login\n"
+                 "  check      Verify the saved camera connection\n"
+                 "  no command starts the MCP stdio server\n";
+    return 0;
+  }
+  if (command == "configure") {
+    if (!isatty(STDIN_FILENO)) throw std::runtime_error("configure requires an interactive terminal");
+    CameraSettings settings = load_settings();
+    const std::string host = prompt("Camera IP or hostname" + (settings.host.empty() ? std::string(": ") : " [" + settings.host + "]: "));
+    if (!host.empty()) settings.host = host;
+    if (settings.host.empty()) throw std::runtime_error("camera address is required");
+    Camera status_camera({settings.host, "", ""});
+    const std::string state = status_camera.activation_status().at("state").get<std::string>();
+    if (state != "activated") throw std::runtime_error("camera state is " + state + "; finish setup in the TP-LINK app or camera web page first");
+    const std::string user = prompt("Camera username [admin]: ");
+    settings.user = user.empty() ? "admin" : user;
+    settings.password = prompt_password();
+    if (settings.password.empty()) throw std::runtime_error("camera password is required");
+    Camera camera(settings);
+    const Json basic = camera.get("device_info", {"basic_info"}).at("basic_info");
+    save_settings(settings);
+    std::cout << "Connected to " << basic.value("device_model", "camera") << ". Configuration saved to " << config_path() << "\n";
+    return 0;
+  }
+  if (command == "check") {
+    Camera camera;
+    const Json basic = camera.get("device_info", {"basic_info"}).at("basic_info");
+    std::cout << "Ready: " << basic.value("device_model", "camera") << "\n";
+    return 0;
+  }
+  throw std::runtime_error("unknown command; use --help");
+}
+
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
   curl_global_init(CURL_GLOBAL_DEFAULT);
+  if (argc > 1) {
+    try {
+      const int result = command_line(argc, argv);
+      curl_global_cleanup();
+      return result;
+    } catch (const std::exception& error) {
+      std::cerr << error.what() << '\n';
+      curl_global_cleanup();
+      return 1;
+    }
+  }
   std::unique_ptr<Camera> camera;
   std::string line;
   while (std::getline(std::cin, line)) {

@@ -23,7 +23,7 @@ curl_source="/tmp/curl-${curl_version}"
   make -j2 -C lib >/tmp/tplink-curl-build.log
 )
 
-version=0.1.0
+version=0.2.0
 case "${GITHUB_REF:-}" in
   refs/tags/v*) version="${GITHUB_REF_NAME#v}" ;;
 esac

@@ -18,6 +18,14 @@ JSON 接口的登录流程：
 
 `/ds` 请求采用 JSON，包含 `method`（`get`、`set` 或 `do`）及模块名称。接口字段和允许值依固件而定。MCP 工具负责构造请求、检查设备错误码和保护会话令牌。
 
+### 设备激活与账号
+
+未登录访问 `GET /pc/Content.htm` 时，响应 `data.code=-40414` 表示需要首次激活，`-40407` 表示已激活且需要登录，`-40405` 表示需要修改密码。`camera_activation_status` 根据这一状态判断，不向设备写入数据。
+
+本机型的网页激活页面将用户名固定为 `admin`，要求设置 8–64 位密码。页面先使用新密码完成激活态登录，再读取 `function.module_spec` 和 `user_management.get_encrypt_info`，最后调用 `user_management.change_user_info` 设置 `root` 账号密码。密码字段经过设备指定的加密方式处理；已激活设备不会通过这些接口返回原始密码。当前 MCP 仅提供激活状态查询，首次设置或重置密码仍需使用设备官方界面。
+
+设备另外提供 `user_management.root`、`admin`、`guest` 查询。此固件上的 `root` 用户名为 `admin`；测试设备的 `admin` 与 `guest` 列表为空。其他账号管理操作尚未纳入 MCP。
+
 ## 功能与接口对应
 
 | 功能 | 本地接口 |
@@ -36,7 +44,7 @@ JSON 接口的登录流程：
 
 ## 人形报警信号
 
-该固件通过 `people_detection` 进行设备端人形侦测。~~由于作者没能找到人形侦测相关事件~~，`camera_person_alarm` 使用人形白光联动作为局域网信号：
+该固件通过 `people_detection` 进行设备端人形侦测。`camera_person_alarm` 使用人形白光联动作为局域网信号：
 
 1. 确认人形侦测已启用，且已知的其他声光联动不会干扰判断；
 2. 在调用窗口内启用人形白光联动，关闭普通移动白光联动；

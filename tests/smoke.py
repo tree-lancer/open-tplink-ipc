@@ -1,4 +1,4 @@
-"""Read-only MCP protocol and live camera smoke check. Uses IPC_* environment."""
+"""Read-only MCP protocol and live camera smoke check. Uses saved config or IPC_* environment."""
 
 import json
 import os
@@ -8,11 +8,6 @@ import sys
 
 
 binary = pathlib.Path(__file__).resolve().parents[1] / "build" / "tplink-ipc-mcp"
-for name in ("IPC_HOST", "IPC_USER", "IPC_PASSWORD"):
-    if not os.environ.get(name):
-        raise SystemExit(f"missing {name}")
-
-
 def request(ident, method, params=None):
     value = {"jsonrpc": "2.0", "id": ident, "method": method}
     if params is not None:
@@ -53,5 +48,6 @@ assert "person" in status and "storage" in status
 assert -1 <= position["pan"] <= 1 and -1 <= position["tilt"] <= 1
 assert responses[8]["result"]["content"][0]["type"] == "image"
 assert len(responses[8]["result"]["content"][0]["data"]) > 1000
-assert os.environ["IPC_PASSWORD"] not in result.stdout
+if os.environ.get("IPC_PASSWORD"):
+    assert os.environ["IPC_PASSWORD"] not in result.stdout
 print("MCP live smoke: passed", file=sys.stderr)
